@@ -1,0 +1,75 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. 拉取代码 ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. 安装系统依赖 ──────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip \
+            openjdk-17-jdk \
+            python3-pip \
+            autoconf libtool pkg-config \
+            libssl-dev libffi-dev \
+            libltdl-dev \
+            libsqlite3-dev \
+            build-essential \
+            ccache
+
+      # ── 3. 配置 Java ─────────────────────────────────────────────
+      - name: Set up Java 17
+        run: |
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+      # ── 4. 安装 Python 工具 ──────────────────────────────────────
+      - name: Install Python packages
+        run: |
+          pip3 install --upgrade pip
+          pip3 install buildozer==1.5.0 cython==3.0.3
+
+      # ── 5. 缓存 Android SDK / NDK（大幅加速重复构建）────────────
+      - name: Cache buildozer global directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      # ── 6. 编译 APK ──────────────────────────────────────────────
+      - name: Build APK (debug)
+        run: |
+          buildozer android debug 2>&1 | tee build.log
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
+      # ── 7. 上传 APK 为 Artifact（可直接下载）────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xj-eeprom-tool-apk
+          path: bin/*.apk
+          if-no-files-found: error
+
+      # ── 8. 构建失败时上传日志，方便排查 ─────────────────────────
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
