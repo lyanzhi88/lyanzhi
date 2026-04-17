@@ -11,52 +11,77 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 缓存 SDK/NDK（加速重复构建）─────────────────────────────
-      - name: Cache buildozer global directory
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            git zip unzip wget \
+            openjdk-17-jdk \
+            python3-pip python3-dev \
+            autoconf automake libtool \
+            pkg-config libssl-dev libffi-dev \
+            build-essential cmake \
+            libncurses5 libstdc++6 \
+            ccache
+
+      - name: Set JAVA_HOME
+        run: |
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          java -version
+
+      - name: Install Python tools
+        run: |
+          pip3 install --upgrade pip setuptools wheel
+          pip3 install "cython==0.29.37"
+          pip3 install "buildozer==1.5.0"
+          buildozer version
+
+      - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-docker-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            buildozer-docker-${{ runner.os }}-
+          key: bz-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: bz-${{ runner.os }}-
 
-      # ── 用 Kivy 官方 Docker 镜像编译 ─────────────────────────────
-      # 镜像内已预装：正确版本的 buildozer、Cython、Android SDK/NDK
-      - name: Build APK with Kivy Docker
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: android debug
-          workdir: .
-          buildozer_version: stable
+      - name: Accept SDK licenses
+        run: |
+          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
+            > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
 
-      # ── 诊断：列出生成物 ──────────────────────────────────────────
-      - name: List output
+      - name: Build APK
+        run: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          buildozer -v android debug 2>&1 | tee full_build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Check result
         if: always()
         run: |
           echo "=== bin/ ==="
           ls -lah bin/ 2>/dev/null || echo "bin/ 不存在"
-          echo "=== 搜索所有 .apk ==="
-          find . -name "*.apk" 2>/dev/null || echo "未找到任何 APK"
+          echo "=== 全局 APK ==="
+          find . -name "*.apk" 2>/dev/null || echo "无 APK"
+          echo "=== build.log 最后 150 行 ==="
+          tail -150 full_build.log 2>/dev/null
 
-      # ── 上传 APK ──────────────────────────────────────────────────
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: xj-eeprom-apk
           path: bin/*.apk
           if-no-files-found: error
 
-      # ── 始终上传编译日志 ──────────────────────────────────────────
-      - name: Upload build log
+      - name: Upload full log (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: |
-            *.log
-            .buildozer/android/platform/build-*/dists/*/build.log
+          name: full-build-log
+          path: full_build.log
           if-no-files-found: ignore
