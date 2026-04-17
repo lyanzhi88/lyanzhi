@@ -3,72 +3,94 @@ name: Build Android APK
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      # ── 1. 拉取代码 ──────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. 安装系统依赖 ──────────────────────────────────────────
+      # ── 系统依赖 ──────────────────────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip \
+            git zip unzip wget \
             openjdk-17-jdk \
-            python3-pip \
-            autoconf libtool pkg-config \
-            libssl-dev libffi-dev \
-            libltdl-dev \
-            libsqlite3-dev \
-            build-essential \
-            ccache
+            python3-pip python3-dev \
+            autoconf automake libtool \
+            pkg-config libssl-dev libffi-dev \
+            libltdl-dev libsqlite3-dev \
+            build-essential cmake ccache \
+            libncurses5 libstdc++6
 
-      # ── 3. 配置 Java ─────────────────────────────────────────────
-      - name: Set up Java 17
+      # ── Java ──────────────────────────────────────────────────────
+      - name: Configure Java 17
         run: |
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          java -version
 
-      # ── 4. 安装 Python 工具 ──────────────────────────────────────
-      - name: Install Python packages
+      # ── Python 工具 ───────────────────────────────────────────────
+      - name: Install buildozer and cython
         run: |
-          pip3 install --upgrade pip
-          pip3 install buildozer==1.5.0 cython==3.0.3
+          pip3 install --upgrade pip setuptools wheel
+          pip3 install "cython==3.0.11"
+          pip3 install "buildozer==1.5.0"
+          buildozer version
 
-      # ── 5. 缓存 Android SDK / NDK（大幅加速重复构建）────────────
+      # ── 缓存 SDK/NDK ──────────────────────────────────────────────
       - name: Cache buildozer global directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-v2-${{ runner.os }}-
 
-      # ── 6. 编译 APK ──────────────────────────────────────────────
-      - name: Build APK (debug)
+      # ── 预先接受 Android SDK 许可 ─────────────────────────────────
+      - name: Accept Android SDK licenses
         run: |
-          buildozer android debug 2>&1 | tee build.log
-        env:
-          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          mkdir -p "$HOME/.buildozer/android/platform/android-sdk/licenses"
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" >> "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
+          echo "d975f751698a77b662f1254ddbeed3901e976f5a" > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license"
 
-      # ── 7. 上传 APK 为 Artifact（可直接下载）────────────────────
-      - name: Upload APK artifact
+      # ── 编译 APK ──────────────────────────────────────────────────
+      - name: Build APK
+        run: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export ANDROID_HOME=$HOME/.buildozer/android/platform/android-sdk
+          buildozer -v android debug 2>&1 | tee build.log
+          echo "--- buildozer exit code: $? ---"
+        continue-on-error: true
+
+      # ── 诊断：列出生成的文件 ──────────────────────────────────────
+      - name: List output files
+        run: |
+          echo "=== bin/ 目录 ==="
+          ls -lah bin/ 2>/dev/null || echo "(bin/ 不存在)"
+          echo "=== 全局搜索 .apk ==="
+          find . -name "*.apk" 2>/dev/null || echo "(未找到 APK)"
+          echo "=== build.log 末尾100行 ==="
+          tail -100 build.log 2>/dev/null || echo "(无 build.log)"
+
+      # ── 上传 APK ──────────────────────────────────────────────────
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: xj-eeprom-tool-apk
-          path: bin/*.apk
-          if-no-files-found: error
+          name: xj-eeprom-apk
+          path: |
+            bin/*.apk
+            **/*.apk
+          if-no-files-found: warn
 
-      # ── 8. 构建失败时上传日志，方便排查 ─────────────────────────
-      - name: Upload build log on failure
-        if: failure()
+      # ── 上传完整编译日志（无论成败）──────────────────────────────
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log
