@@ -14,6 +14,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── 1. 系统依赖 ───────────────────────────────────────────────
       - name: Install system deps
         run: |
           sudo apt-get update -qq
@@ -23,15 +24,17 @@ jobs:
             python3-pip python3-dev \
             autoconf automake libtool \
             pkg-config libssl-dev libffi-dev \
-            build-essential cmake \
-            libncurses5 libstdc++6 \
-            ccache
+            build-essential ccache
 
-      - name: Set JAVA_HOME
+      # ── 2. 强制 Java 17（修复 buildozer 找到 Java11 的问题）───────
+      - name: Force Java 17
         run: |
+          sudo update-java-alternatives -s java-1.17.0-openjdk-amd64 2>/dev/null || true
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           java -version
 
+      # ── 3. Python 工具（Cython < 3.0 兼容 buildozer）────────────
       - name: Install Python tools
         run: |
           pip3 install --upgrade pip setuptools wheel
@@ -39,46 +42,79 @@ jobs:
           pip3 install "buildozer==1.5.0"
           buildozer version
 
+      # ── 4. 缓存 buildozer 目录 ────────────────────────────────────
       - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: bz-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: bz-${{ runner.os }}-
+          key: bz-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
+          restore-keys: bz-${{ runner.os }}-v3-
 
-      - name: Accept SDK licenses
+      # ── 5. 预装 Android SDK cmdline-tools（关键修复）────────────
+      # buildozer 找 tools/bin/sdkmanager，但新版 SDK 在 cmdline-tools/latest/bin/
+      # 解决：下载 cmdline-tools，再建软链接到旧路径
+      - name: Setup Android SDK
         run: |
-          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
-          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
-            > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
-          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
-            > ~/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
 
+          # 下载 cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+               -O /tmp/cmdtools.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools_tmp
+          mv /tmp/cmdtools_tmp/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+
+          # 建旧路径软链接（buildozer 兼容）
+          mkdir -p "$SDK_ROOT/tools/bin"
+          ln -sf "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+                 "$SDK_ROOT/tools/bin/sdkmanager"
+
+          export PATH="$SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+
+          # 接受许可
+          yes | sdkmanager --licenses --sdk_root="$SDK_ROOT" 2>/dev/null || true
+
+          # 安装必要组件
+          sdkmanager --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2"
+
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          echo "SDK 安装完成"
+          ls "$SDK_ROOT"
+
+      # ── 6. 编译 APK ───────────────────────────────────────────────
       - name: Build APK
         run: |
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          java -version
           buildozer -v android debug 2>&1 | tee full_build.log
-          echo "BUILD_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+          echo "exit: ${PIPESTATUS[0]}"
 
-      - name: Check result
+      # ── 7. 诊断 ───────────────────────────────────────────────────
+      - name: Show results
         if: always()
         run: |
           echo "=== bin/ ==="
           ls -lah bin/ 2>/dev/null || echo "bin/ 不存在"
-          echo "=== 全局 APK ==="
+          echo "=== 搜索 APK ==="
           find . -name "*.apk" 2>/dev/null || echo "无 APK"
-          echo "=== build.log 最后 150 行 ==="
-          tail -150 full_build.log 2>/dev/null
 
+      # ── 8. 上传 APK ───────────────────────────────────────────────
       - name: Upload APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: xj-eeprom-apk
           path: bin/*.apk
           if-no-files-found: error
 
-      - name: Upload full log (always)
+      # ── 9. 始终上传日志 ───────────────────────────────────────────
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
