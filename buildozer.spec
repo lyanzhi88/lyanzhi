@@ -2,7 +2,7 @@
 title = 西继迅达EEPROM工具
 package.name = xjeepromtool
 package.domain = org.xjeeprom
-source.main = xj_eeprom_android
+source.main = main
 version = 1.0
 source.dir = .
 source.include_exts = py
