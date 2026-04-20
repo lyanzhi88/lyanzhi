@@ -50,24 +50,29 @@ jobs:
           key: bz-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
           restore-keys: bz-${{ runner.os }}-v3-
 
-      # ── 5. 预装 Android SDK cmdline-tools（关键修复）────────────
-      # buildozer 找 tools/bin/sdkmanager，但新版 SDK 在 cmdline-tools/latest/bin/
-      # 解决：下载 cmdline-tools，再建软链接到旧路径
+      # ── 5. 预装 Android SDK cmdline-tools ───────────────────────
       - name: Setup Android SDK
         run: |
           SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           mkdir -p "$SDK_ROOT/cmdline-tools"
 
-          # 下载 cmdline-tools
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-               -O /tmp/cmdtools.zip
-          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools_tmp
-          mv /tmp/cmdtools_tmp/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+          # 如果缓存已有 sdkmanager，跳过下载（避免 mv 覆盖已存在目录报错）
+          if [ -f "$SDKMANAGER" ]; then
+            echo "cmdline-tools 已在缓存中，跳过下载"
+          else
+            echo "下载 Android cmdline-tools..."
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+                 -O /tmp/cmdtools.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools_tmp
+            # 目标若已存在先删除再移入，彻底避免冲突
+            rm -rf "$SDK_ROOT/cmdline-tools/latest"
+            mv /tmp/cmdtools_tmp/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+          fi
 
-          # 建旧路径软链接（buildozer 兼容）
+          # 建旧路径软链接（buildozer 兼容，每次确保存在）
           mkdir -p "$SDK_ROOT/tools/bin"
-          ln -sf "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-                 "$SDK_ROOT/tools/bin/sdkmanager"
+          ln -sf "$SDKMANAGER" "$SDK_ROOT/tools/bin/sdkmanager"
 
           export PATH="$SDK_ROOT/cmdline-tools/latest/bin:$PATH"
           export ANDROID_SDK_ROOT="$SDK_ROOT"
@@ -75,18 +80,17 @@ jobs:
           # 接受许可
           yes | sdkmanager --licenses --sdk_root="$SDK_ROOT" 2>/dev/null || true
 
-          # 安装必要组件
+          # 安装必要组件（已安装则跳过）
           sdkmanager --sdk_root="$SDK_ROOT" \
             "platform-tools" \
             "platforms;android-33" \
-            "build-tools;33.0.2"
+            "build-tools;33.0.2" 2>/dev/null || true
 
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
           echo "$SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$SDK_ROOT/platform-tools" >> $GITHUB_PATH
-          echo "SDK 安装完成"
-          ls "$SDK_ROOT"
+          echo "$SDK_ROOT/platform-tools"            >> $GITHUB_PATH
+          echo "=== SDK 目录 ===" && ls "$SDK_ROOT"
 
       # ── 6. 编译 APK ───────────────────────────────────────────────
       - name: Build APK
