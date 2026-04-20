@@ -264,6 +264,7 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.metrics import dp
 from kivy.core.window import Window
 from kivy.utils import platform
+from kivy.clock import Clock
 
 # 颜色主题
 C_BG      = (0.08, 0.09, 0.11, 1)    # 深黑底色
@@ -347,27 +348,175 @@ def make_result_box(text, color=C_CARD):
     return sv
 
 
-# ── 文件选择弹窗 ─────────────────────────────────────────────────────────────
+# ── Android 运行时权限 ────────────────────────────────────────────────────────
 
-class FileDialog(Popup):
+def request_android_permissions(callback=None):
+    """申请 Android 存储权限（API 23+必须运行时申请）"""
+    if platform != 'android':
+        if callback:
+            callback()
+        return
+    try:
+        from android.permissions import request_permissions, Permission, check_permission
+        perms = [Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
+        def on_result(permissions, grants):
+            if callback:
+                callback()
+        request_permissions(perms, on_result)
+    except Exception:
+        if callback:
+            callback()
+
+
+# ── 搜索BIN文件弹窗 ───────────────────────────────────────────────────────────
+
+# Android 常见存储路径
+ANDROID_SEARCH_ROOTS = [
+    '/sdcard',
+    '/sdcard/Download',
+    '/sdcard/Downloads',
+    '/sdcard/Documents',
+    '/storage/emulated/0',
+    '/storage/emulated/0/Download',
+    '/storage/emulated/0/Downloads',
+    '/storage/emulated/0/Documents',
+    '/sdcard/DCIM',
+    '/sdcard/Pictures',
+]
+
+def find_bin_files(roots=None, max_depth=4, extensions=('.bin', '.BIN', '.dat', '.DAT')):
+    """递归搜索 BIN 文件，返回路径列表"""
+    if roots is None:
+        if platform == 'android':
+            roots = ANDROID_SEARCH_ROOTS
+        else:
+            roots = [os.path.expanduser('~')]
+
+    found = []
+    visited = set()
+
+    def _scan(path, depth):
+        if depth > max_depth:
+            return
+        try:
+            real = os.path.realpath(path)
+            if real in visited:
+                return
+            visited.add(real)
+            for entry in os.scandir(path):
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        if entry.name.lower().endswith(extensions):
+                            found.append(entry.path)
+                    elif entry.is_dir(follow_symlinks=False):
+                        # 跳过隐藏目录和系统目录
+                        if not entry.name.startswith('.') and entry.name not in (
+                            'Android', 'proc', 'sys', 'dev', 'acct'):
+                            _scan(entry.path, depth + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    for root in roots:
+        if os.path.isdir(root):
+            _scan(root, 0)
+
+    return sorted(set(found))
+
+
+class SearchDialog(Popup):
+    """搜索设备中 BIN 文件的弹窗"""
     def __init__(self, callback, **kw):
         super().__init__(**kw)
         self.callback = callback
-        self.title = '选择 BIN 文件'
+        self.title = '搜索 BIN 文件'
+        self.size_hint = (0.96, 0.88)
+        self.background_color = (0.10, 0.11, 0.14, 1)
+
+        self._layout = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(8))
+
+        self.status_lbl = make_label(
+            '正在搜索，请稍候...',
+            font_size=13, color=C_WARN,
+            size_hint_y=None, height=dp(36))
+        self._layout.add_widget(self.status_lbl)
+
+        self.sv = ScrollView()
+        self.list_box = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(4))
+        self.list_box.bind(minimum_height=self.list_box.setter('height'))
+        self.sv.add_widget(self.list_box)
+        self._layout.add_widget(self.sv)
+
+        close_btn = make_btn('关闭', color=(0.3, 0.3, 0.35, 1),
+                              on_press=lambda _: self.dismiss(), height=44)
+        self._layout.add_widget(close_btn)
+
+        self.content = self._layout
+        # 打开后延迟搜索（让UI先渲染）
+        Clock.schedule_once(self._do_search, 0.3)
+
+    def _do_search(self, *_):
+        import threading
+        def run():
+            files = find_bin_files()
+            Clock.schedule_once(lambda _: self._show_results(files), 0)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_results(self, files):
+        self.list_box.clear_widgets()
+        if not files:
+            self.status_lbl.text = '未找到 BIN 文件\n请手动输入路径或将文件放到Download目录'
+            self.status_lbl.color = C_DANGER
+            return
+
+        self.status_lbl.text = f'找到 {len(files)} 个文件，点击选择：'
+        self.status_lbl.color = C_SUCCESS
+
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            fdir  = os.path.dirname(fpath)
+            row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(0))
+            btn = Button(
+                text=f'{fname}\n[size=11][color=888888]{fdir}[/color][/size]',
+                markup=True,
+                halign='left',
+                valign='middle',
+                font_size=dp(13),
+                background_normal='',
+                background_color=(0.16, 0.19, 0.24, 1),
+                color=C_TEXT,
+                padding=[dp(10), dp(6)],
+            )
+            btn.bind(size=lambda i, v: setattr(i, 'text_size', v))
+            _path = fpath
+            btn.bind(on_press=lambda _, p=_path: self._select(p))
+            row.add_widget(btn)
+            self.list_box.add_widget(row)
+
+    def _select(self, path):
+        self.dismiss()
+        self.callback(path)
+
+
+# ── Kivy 文件浏览器弹窗（备用，PC端或手动浏览）────────────────────────────────
+
+class FileDialog(Popup):
+    def __init__(self, callback, start_path=None, **kw):
+        super().__init__(**kw)
+        self.callback = callback
+        self.title = '浏览文件'
         self.size_hint = (0.95, 0.85)
         self.background_color = C_BG
 
         layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
 
-        # 起始路径
-        if platform == 'android':
-            start = '/sdcard'
-        else:
-            start = os.path.expanduser('~')
+        if start_path is None:
+            start_path = '/sdcard' if platform == 'android' else os.path.expanduser('~')
 
         self.fc = FileChooserListView(
-            path=start,
-            filters=['*.bin', '*.BIN', '*.dat', '*.DAT', '*'],
+            path=start_path,
+            filters=['*.bin', '*.BIN', '*.dat', '*.DAT', '*.*'],
             size_hint_y=1,
         )
         layout.add_widget(self.fc)
@@ -375,7 +524,7 @@ class FileDialog(Popup):
         btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
         btns.add_widget(make_btn('取消', color=(0.3, 0.3, 0.35, 1),
                                   on_press=lambda _: self.dismiss()))
-        btns.add_widget(make_btn('确认', color=C_ACCENT,
+        btns.add_widget(make_btn('确认选择', color=C_ACCENT,
                                   on_press=self._confirm))
         layout.add_widget(btns)
         self.content = layout
@@ -386,18 +535,17 @@ class FileDialog(Popup):
             self.dismiss()
             self.callback(sel[0])
         else:
-            show_toast('请先选择文件')
+            show_toast('请先点击选中一个文件')
 
 
 def show_toast(msg):
     popup = Popup(
         title='', content=Label(text=msg, color=C_TEXT, font_size=dp(14)),
-        size_hint=(0.7, 0.18),
+        size_hint=(0.75, 0.15),
         background_color=(0.15, 0.17, 0.22, 0.95),
     )
     popup.open()
-    from kivy.clock import Clock
-    Clock.schedule_once(lambda _: popup.dismiss(), 2.2)
+    Clock.schedule_once(lambda _: popup.dismiss(), 2.5)
 
 
 # ── 屏幕1：BIN文件提取密码 ───────────────────────────────────────────────────
@@ -407,44 +555,52 @@ class ExtractScreen(Screen):
         super().__init__(**kw)
         self._file_path = ''
         root = BoxLayout(orientation='vertical',
-                         padding=dp(12), spacing=dp(10))
-        root.canvas.before.clear()
+                         padding=dp(10), spacing=dp(8))
 
         # 标题
         root.add_widget(make_label(
             '[b]读取BIN文件 — 提取密码[/b]',
-            font_size=17, halign='center', size_hint_y=None, height=dp(40)))
+            font_size=17, halign='center', size_hint_y=None, height=dp(38)))
 
-        # 提示
-        root.add_widget(make_label(
-            '将EEPROM转储文件(.bin)通过文件管理器复制到手机，\n'
-            '然后在此选择该文件进行解析。',
-            font_size=12, color=C_HINT, size_hint_y=None, height=dp(48)))
+        # ── 选文件区 ──────────────────────────────────────────────
+        # 第1行：原生选择 + 搜索
+        row1 = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+        row1.add_widget(make_btn('系统文件管理器', color=C_ACCENT,
+                                  on_press=self._pick_native))
+        row1.add_widget(make_btn('搜索BIN文件', color=(0.25, 0.55, 0.40, 1),
+                                  on_press=self._search_files))
+        root.add_widget(row1)
 
-        # 文件路径显示
+        # 第2行：手动输入路径
+        path_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.inp_path = make_input(
+            hint='手动输入文件路径，如 /sdcard/Download/data.bin',
+            height=46)
+        path_row.add_widget(self.inp_path)
+        path_row.add_widget(make_btn('浏览', color=(0.30, 0.33, 0.40, 1),
+                                      on_press=self._pick_browse, height=46))
+        root.add_widget(path_row)
+
+        # 已选文件显示
         self.lbl_file = make_label(
-            '未选择文件', font_size=13, color=C_HINT,
-            size_hint_y=None, height=dp(36))
+            '未选择文件', font_size=12, color=C_HINT,
+            size_hint_y=None, height=dp(30))
         root.add_widget(self.lbl_file)
 
-        # 按钮行
-        row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
-        row.add_widget(make_btn('选择BIN文件', color=C_ACCENT,
-                                 on_press=self._pick_file))
-        row.add_widget(make_btn('开始解析', color=C_SUCCESS,
-                                 on_press=self._do_extract))
-        root.add_widget(row)
+        # 解析按钮
+        root.add_widget(make_btn('开始解析', color=C_SUCCESS,
+                                  on_press=self._do_extract, height=50))
 
         # 结果区
         root.add_widget(make_label(
-            '解析结果：', font_size=13, color=C_HINT,
-            size_hint_y=None, height=dp(28)))
+            '解析结果：', font_size=12, color=C_HINT,
+            size_hint_y=None, height=dp(24)))
 
         self.sv = ScrollView()
         self.result_lbl = Label(
             text='', font_size=dp(13), color=C_TEXT,
             halign='left', valign='top', markup=True,
-            size_hint_y=None, padding=[dp(10), dp(8)],
+            size_hint_y=None, padding=[dp(8), dp(6)],
         )
         self.result_lbl.bind(
             texture_size=lambda i, v: setattr(i, 'height', v[1]))
@@ -454,21 +610,64 @@ class ExtractScreen(Screen):
         root.add_widget(self.sv)
 
         self.add_widget(root)
+        # 启动时申请权限
+        Clock.schedule_once(lambda _: request_android_permissions(), 1)
 
-    def _pick_file(self, *_):
-        FileDialog(callback=self._on_file_chosen).open()
+    # ── 方式1：调起系统原生文件管理器（推荐，Android 所有版本）──────
+    def _pick_native(self, *_):
+        if platform == 'android':
+            try:
+                from plyer import filechooser
+                filechooser.open_file(
+                    on_selection=self._on_native_selected,
+                    filters=['*'],
+                    title='选择EEPROM BIN文件',
+                )
+                return
+            except Exception as e:
+                show_toast(f'原生选择器失败: {e}\n请用"浏览"或手动输入路径')
+        # 非Android或plyer失败，用Kivy浏览器
+        self._pick_browse()
+
+    def _on_native_selected(self, selection):
+        if selection:
+            path = selection[0]
+            self._on_file_chosen(path)
+
+    # ── 方式2：搜索设备中的BIN文件 ─────────────────────────────────
+    def _search_files(self, *_):
+        def do_open():
+            SearchDialog(callback=self._on_file_chosen).open()
+        request_android_permissions(callback=do_open)
+
+    # ── 方式3：Kivy内置文件浏览器 ───────────────────────────────────
+    def _pick_browse(self, *_):
+        # 优先从Download目录打开
+        if platform == 'android':
+            starts = ['/sdcard/Download', '/sdcard/Downloads', '/sdcard']
+            start = next((p for p in starts if os.path.isdir(p)), '/sdcard')
+        else:
+            start = os.path.expanduser('~')
+        FileDialog(callback=self._on_file_chosen, start_path=start).open()
 
     def _on_file_chosen(self, path):
         self._file_path = path
-        self.lbl_file.text = f'[color=aaaaaa]{os.path.basename(path)}[/color]'
+        self.inp_path.text = path
+        name = os.path.basename(path)
+        self.lbl_file.text = f'[color=44cc88]已选择: {name}[/color]'
 
     def _do_extract(self, *_):
-        path = self._file_path
+        # 优先用手动输入的路径
+        manual = self.inp_path.text.strip()
+        path = manual if manual else self._file_path
         if not path:
-            self.result_lbl.text = '[color=ff6666]请先选择文件[/color]'
+            self.result_lbl.text = '[color=ff6666]请先选择或输入文件路径[/color]'
             return
+        self._file_path = path
         if not os.path.isfile(path):
-            self.result_lbl.text = f'[color=ff6666]文件不存在:\n{path}[/color]'
+            self.result_lbl.text = (
+                f'[color=ff6666]文件不存在:\n{path}\n\n'
+                f'提示：请将BIN文件复制到手机Download目录后重新搜索[/color]')
             return
         try:
             with open(path, 'rb') as f:
