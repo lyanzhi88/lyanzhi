@@ -350,14 +350,42 @@ def make_result_box(text, color=C_CARD):
 
 # ── Android 运行时权限 ────────────────────────────────────────────────────────
 
+def is_manage_storage_granted():
+    """检查 Android 11+ 的 MANAGE_EXTERNAL_STORAGE 是否已授权"""
+    if platform != 'android':
+        return True
+    try:
+        from jnius import autoclass
+        Environment = autoclass('android.os.Environment')
+        return bool(Environment.isExternalStorageManager())
+    except Exception:
+        return True  # Android 10 以下无此权限，视为已授权
+
+
+def open_manage_storage_settings():
+    """跳转到系统设置页，让用户手动开启「所有文件访问」权限"""
+    try:
+        from jnius import autoclass
+        Intent   = autoclass('android.content.Intent')
+        Settings = autoclass('android.provider.Settings')
+        Uri      = autoclass('android.net.Uri')
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        uri = Uri.fromParts('package', 'org.xjeeprom.xjeepromtool', None)
+        intent.setData(uri)
+        PythonActivity.mActivity.startActivity(intent)
+    except Exception:
+        show_toast('请手动：设置 → 应用 → 西继迅达EEPROM工具 → 权限 → 所有文件访问')
+
+
 def request_android_permissions(callback=None):
-    """申请 Android 存储权限（API 23+必须运行时申请）"""
+    """申请 Android 存储权限（API 23+ 运行时申请）"""
     if platform != 'android':
         if callback:
             callback()
         return
     try:
-        from android.permissions import request_permissions, Permission, check_permission
+        from android.permissions import request_permissions, Permission
         perms = [Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
         def on_result(permissions, grants):
             if callback:
@@ -368,32 +396,66 @@ def request_android_permissions(callback=None):
             callback()
 
 
+def show_permission_popup():
+    """Android 11+ 提示用户开启「所有文件访问」权限"""
+    if is_manage_storage_granted():
+        return  # 已授权，无需提示
+
+    content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(12))
+    content.add_widget(make_label(
+        '[b][color=ffaa33]需要开启「所有文件访问」权限[/color][/b]',
+        font_size=15, halign='center', size_hint_y=None, height=dp(36)))
+    content.add_widget(make_label(
+        'Android 11+ 限制应用访问其他应用的文件。\n\n'
+        '点击下方按钮 → 在设置中找到本应用 → 开启「所有文件访问」\n'
+        '开启后返回即可正常读取BIN文件。',
+        font_size=13, color=C_TEXT, size_hint_y=None, height=dp(100)))
+
+    popup = Popup(
+        title='', size_hint=(0.92, 0.48),
+        background_color=(0.12, 0.14, 0.18, 1))
+
+    btn_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
+    btn_row.add_widget(make_btn('稍后再说', color=(0.3, 0.3, 0.35, 1),
+                                 on_press=lambda _: popup.dismiss()))
+    btn_row.add_widget(make_btn('去开启权限', color=C_ACCENT,
+                                 on_press=lambda _: (popup.dismiss(),
+                                                     open_manage_storage_settings())))
+    content.add_widget(btn_row)
+    popup.content = content
+    popup.open()
+
+
 # ── 搜索BIN文件弹窗 ───────────────────────────────────────────────────────────
 
-# Android 常见存储路径
+# Android 常见存储路径（含飞书/微信/QQ等应用下载目录）
 ANDROID_SEARCH_ROOTS = [
-    '/sdcard',
-    '/sdcard/Download',
-    '/sdcard/Downloads',
-    '/sdcard/Documents',
     '/storage/emulated/0',
     '/storage/emulated/0/Download',
     '/storage/emulated/0/Downloads',
     '/storage/emulated/0/Documents',
-    '/sdcard/DCIM',
-    '/sdcard/Pictures',
+    '/sdcard',
+    '/sdcard/Download',
+    '/sdcard/Downloads',
+    '/sdcard/Documents',
+    # 常见通讯软件下载目录
+    '/storage/emulated/0/Download/Lark',
+    '/storage/emulated/0/Download/WeChat',
+    '/storage/emulated/0/Download/QQ',
+    '/storage/emulated/0/tencent/MicroMsg',
+    '/sdcard/Download/Lark',
+    '/sdcard/Download/WeChat',
+    '/sdcard/tencent',
 ]
 
-def find_bin_files(roots=None, max_depth=4, extensions=('.bin', '.BIN', '.dat', '.DAT')):
+def find_bin_files(roots=None, max_depth=5, extensions=('.bin', '.BIN', '.dat', '.DAT')):
     """递归搜索 BIN 文件，返回路径列表"""
     if roots is None:
-        if platform == 'android':
-            roots = ANDROID_SEARCH_ROOTS
-        else:
-            roots = [os.path.expanduser('~')]
+        roots = ANDROID_SEARCH_ROOTS if platform == 'android' else [os.path.expanduser('~')]
 
     found = []
     visited = set()
+    perm_denied = []
 
     def _scan(path, depth):
         if depth > max_depth:
@@ -403,15 +465,19 @@ def find_bin_files(roots=None, max_depth=4, extensions=('.bin', '.BIN', '.dat', 
             if real in visited:
                 return
             visited.add(real)
-            for entry in os.scandir(path):
+            try:
+                entries = list(os.scandir(path))
+            except PermissionError:
+                perm_denied.append(path)
+                return
+            for entry in entries:
                 try:
                     if entry.is_file(follow_symlinks=False):
                         if entry.name.lower().endswith(extensions):
                             found.append(entry.path)
                     elif entry.is_dir(follow_symlinks=False):
-                        # 跳过隐藏目录和系统目录
                         if not entry.name.startswith('.') and entry.name not in (
-                            'Android', 'proc', 'sys', 'dev', 'acct'):
+                                'proc', 'sys', 'dev', 'acct', 'data', 'obb'):
                             _scan(entry.path, depth + 1)
                 except Exception:
                     pass
@@ -422,7 +488,7 @@ def find_bin_files(roots=None, max_depth=4, extensions=('.bin', '.BIN', '.dat', 
         if os.path.isdir(root):
             _scan(root, 0)
 
-    return sorted(set(found))
+    return sorted(set(found)), perm_denied
 
 
 class SearchDialog(Popup):
@@ -459,18 +525,29 @@ class SearchDialog(Popup):
     def _do_search(self, *_):
         import threading
         def run():
-            files = find_bin_files()
-            Clock.schedule_once(lambda _: self._show_results(files), 0)
+            files, denied = find_bin_files()
+            Clock.schedule_once(lambda _: self._show_results(files, denied), 0)
         threading.Thread(target=run, daemon=True).start()
 
-    def _show_results(self, files):
+    def _show_results(self, files, denied=None):
         self.list_box.clear_widgets()
         if not files:
-            self.status_lbl.text = '未找到 BIN 文件\n请手动输入路径或将文件放到Download目录'
+            tip = '未找到 BIN 文件'
+            if denied:
+                tip += '\n\n[color=ffaa33]部分目录因权限被拒绝无法扫描。\n请点「去开启权限」后重新搜索。[/color]'
+                btn = make_btn('去开启权限', color=C_ACCENT,
+                               on_press=lambda _: (self.dismiss(),
+                                                   open_manage_storage_settings()),
+                               height=44)
+                self.list_box.add_widget(btn)
+            self.status_lbl.text = tip
             self.status_lbl.color = C_DANGER
             return
 
-        self.status_lbl.text = f'找到 {len(files)} 个文件，点击选择：'
+        hint = f'找到 {len(files)} 个文件，点击选择：'
+        if denied:
+            hint += f'  [color=ffaa33]({len(denied)}个目录权限不足)[/color]'
+        self.status_lbl.text = hint
         self.status_lbl.color = C_SUCCESS
 
         for fpath in files:
@@ -610,8 +687,11 @@ class ExtractScreen(Screen):
         root.add_widget(self.sv)
 
         self.add_widget(root)
-        # 启动时申请权限
-        Clock.schedule_once(lambda _: request_android_permissions(), 1)
+        # 启动时：申请基础权限，并检查 MANAGE_EXTERNAL_STORAGE
+        Clock.schedule_once(lambda _: request_android_permissions(
+            callback=lambda: Clock.schedule_once(
+                lambda _: show_permission_popup(), 0.5)
+        ), 1)
 
     # ── 方式1：调起系统原生文件管理器（推荐，Android 所有版本）──────
     def _pick_native(self, *_):
@@ -672,6 +752,15 @@ class ExtractScreen(Screen):
         try:
             with open(path, 'rb') as f:
                 dump = f.read()
+        except PermissionError:
+            # 权限拒绝：引导用户开启「所有文件访问」
+            self.result_lbl.text = (
+                '[color=ff6666]读取失败：权限不足[/color]\n\n'
+                '[color=ffaa33]Android 11+ 需要开启「所有文件访问」权限：\n'
+                '点击下方按钮 → 在设置中找到本应用 → 开启权限 → 返回重试[/color]'
+            )
+            Clock.schedule_once(lambda _: show_permission_popup(), 0.3)
+            return
         except Exception as e:
             self.result_lbl.text = f'[color=ff6666]读取失败: {e}[/color]'
             return
