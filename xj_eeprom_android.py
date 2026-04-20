@@ -236,6 +236,21 @@ def build_eeprom_image(custom_password: int = None) -> bytes:
 from kivy.config import Config
 Config.set('graphics', 'resizable', True)
 
+# ── 注册中文字体（微软雅黑），覆盖 Kivy 默认字体，解决中文显示为方块的问题
+import os as _os
+from kivy.core.text import LabelBase as _LabelBase
+_font_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'msyh.ttc')
+if not _os.path.exists(_font_path):
+    # Android 打包后文件在当前目录
+    _font_path = 'msyh.ttc'
+_LabelBase.register(
+    name='Roboto',
+    fn_regular=_font_path,
+    fn_bold=_font_path,
+    fn_italic=_font_path,
+    fn_bolditalic=_font_path,
+)
+
 from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
 from kivy.uix.boxlayout import BoxLayout

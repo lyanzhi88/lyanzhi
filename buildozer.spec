@@ -5,7 +5,7 @@ package.domain = org.xjeeprom
 source.main = main
 version = 1.0
 source.dir = .
-source.include_exts = py
+source.include_exts = py,ttc
 
 # 依赖：kivy 官方 Android 支持版本
 requirements = python3,kivy==2.2.1
