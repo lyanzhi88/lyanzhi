@@ -668,6 +668,21 @@ class ExtractScreen(Screen):
         root.add_widget(make_btn('开始解析', color=C_SUCCESS,
                                   on_press=self._do_extract, height=50))
 
+        # 复制按钮区（解析成功后显示）
+        self._pw     = None
+        self._alt_pw = None
+        self.copy_row = BoxLayout(
+            size_hint_y=None, height=0, spacing=dp(6), opacity=0)
+        self.btn_copy_pw = make_btn(
+            '复制主密码', color=(0.20, 0.45, 0.75, 1),
+            on_press=self._copy_pw, height=44)
+        self.btn_copy_alt = make_btn(
+            '复制备用密码', color=(0.35, 0.35, 0.45, 1),
+            on_press=self._copy_alt, height=44)
+        self.copy_row.add_widget(self.btn_copy_pw)
+        self.copy_row.add_widget(self.btn_copy_alt)
+        root.add_widget(self.copy_row)
+
         # 结果区
         root.add_widget(make_label(
             '解析结果：', font_size=12, color=C_HINT,
@@ -716,9 +731,8 @@ class ExtractScreen(Screen):
 
     # ── 方式2：搜索设备中的BIN文件 ─────────────────────────────────
     def _search_files(self, *_):
-        def do_open():
-            SearchDialog(callback=self._on_file_chosen).open()
-        request_android_permissions(callback=do_open)
+        # 直接打开搜索弹窗，不再依赖权限回调（已授权时回调不触发导致无反应）
+        SearchDialog(callback=self._on_file_chosen).open()
 
     # ── 方式3：Kivy内置文件浏览器 ───────────────────────────────────
     def _pick_browse(self, *_):
@@ -823,8 +837,32 @@ class ExtractScreen(Screen):
                 )
 
         self.result_lbl.text = '\n'.join(lines)
+
+        # 保存密码并显示复制按钮
+        self._pw     = pw
+        self._alt_pw = alt_pw
+        self.copy_row.height   = dp(50)
+        self.copy_row.opacity  = 1
+        self.btn_copy_pw.text  = f'复制主密码  {pw}'
+        self.btn_copy_alt.text = f'复制备用密码  {alt_pw}'
+
         # 保存 param_114 供主码页使用
         App.get_running_app().last_param114 = p114
+
+    # ── 复制到剪贴板 ──────────────────────────────────────────────
+    def _copy_pw(self, *_):
+        if self._pw is None:
+            return
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(str(self._pw))
+        show_toast(f'已复制主密码：{self._pw}')
+
+    def _copy_alt(self, *_):
+        if self._alt_pw is None:
+            return
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(str(self._alt_pw))
+        show_toast(f'已复制备用密码：{self._alt_pw}')
 
 
 # ── 屏幕2：手动字节计算密码 ──────────────────────────────────────────────────
@@ -1030,6 +1068,21 @@ class MasterScreen(Screen):
         root.add_widget(make_btn('计算全权主码', color=C_SUCCESS,
                                   on_press=self._calc))
 
+        # 复制按钮区（计算成功后显示）
+        self._master_pw = None
+        self._delay_pw  = None
+        self.copy_row = BoxLayout(
+            size_hint_y=None, height=0, spacing=dp(6), opacity=0)
+        self.btn_copy_master = make_btn(
+            '复制全权主码', color=(0.15, 0.50, 0.75, 1),
+            on_press=self._copy_master, height=44)
+        self.btn_copy_delay = make_btn(
+            '复制延时主码', color=(0.35, 0.35, 0.50, 1),
+            on_press=self._copy_delay, height=44)
+        self.copy_row.add_widget(self.btn_copy_master)
+        self.copy_row.add_widget(self.btn_copy_delay)
+        root.add_widget(self.copy_row)
+
         self.result_lbl = make_label(
             '', font_size=14, size_hint_y=None, height=dp(180))
         root.add_widget(self.result_lbl)
@@ -1070,6 +1123,13 @@ class MasterScreen(Screen):
 
         master_pw, delay_pw = calc_master_password(sys_cd, param_114)
 
+        self._master_pw = master_pw
+        self._delay_pw  = delay_pw
+        self.copy_row.height  = dp(50)
+        self.copy_row.opacity = 1
+        self.btn_copy_master.text = f'复制全权主码  {master_pw:09d}'
+        self.btn_copy_delay.text  = f'复制延时主码  {delay_pw:09d}'
+
         key8 = struct.pack('<II', param_114, sys_cd)
         self.result_lbl.text = (
             f'SysCD:     0x{sys_cd:08X}\n'
@@ -1081,6 +1141,20 @@ class MasterScreen(Screen):
             f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
             f'[color=ffaa33]在驱动器Special Para密码框输入全权主码即可进入[/color]'
         )
+
+    def _copy_master(self, *_):
+        if self._master_pw is None:
+            return
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(f'{self._master_pw:09d}')
+        show_toast(f'已复制全权主码：{self._master_pw:09d}')
+
+    def _copy_delay(self, *_):
+        if self._delay_pw is None:
+            return
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(f'{self._delay_pw:09d}')
+        show_toast(f'已复制延时主码：{self._delay_pw:09d}')
 
 
 # ── 底部导航栏 ───────────────────────────────────────────────────────────────
