@@ -154,9 +154,12 @@ def verify_block(plaintext: bytes, data_len: int):
 def _try_page(dump: bytes, page_base: int) -> dict:
     if page_base + 0x800 > len(dump):
         return {}
+    # 页 CRC 用固件非标 CRC（sub_1E4A0），不是标准 CRC32
+    # 已用 IDA + 数据.bin 实测：stored 0x1A851A90/0x9B20762D 仅 fw_crc 匹配
     try:
         stored_crc   = struct.unpack_from('<I', dump, page_base)[0]
-        computed_crc = crc32(dump[page_base + 4 : page_base + 0x800])
+        computed_crc = _firmware_crc(
+            dump[page_base + 4 : page_base + 0x800], poly=0xEDB88320)
         crc_ok       = (stored_crc == computed_crc)
     except Exception:
         stored_crc = computed_crc = 0
@@ -239,7 +242,8 @@ def build_eeprom_image(custom_password: int = None) -> bytes:
     page = bytearray(0x1000)
     page[0x400 : 0x400 + 0xFC] = cipher1
     page[0x700 : 0x700 + 0xFA] = cipher2
-    crc_val = crc32(bytes(page[4:0x800]))
+    # 页 CRC 用固件非标 CRC，与 sub_1F3E8 写入逻辑一致
+    crc_val = _firmware_crc(bytes(page[4:0x800]), poly=0xEDB88320)
     struct.pack_into('<I', page, 0, crc_val)
 
     image = bytearray(0x2800)
