@@ -332,7 +332,7 @@ def make_input(hint='', multiline=False, height=44, **kw):
     return ti
 
 
-def make_btn(text, color=C_ACCENT, on_press=None, height=48):
+def make_btn(text, color=C_ACCENT, on_press=None, height=48, **kw):
     btn = Button(
         text=text,
         size_hint_y=None,
@@ -342,6 +342,7 @@ def make_btn(text, color=C_ACCENT, on_press=None, height=48):
         color=C_TEXT,
         font_size=dp(15),
         bold=True,
+        **kw,
     )
     if on_press:
         btn.bind(on_press=on_press)
