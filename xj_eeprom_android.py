@@ -83,6 +83,25 @@ FACTORY_BLOCK2 = bytes([
 ])
 
 
+# 已知合同库（出厂编号前缀 → param_114）
+# 用于无 EEPROM 转储时按合同号查询批次主码
+KNOWN_CONTRACT_PARAM114 = {
+    '2109142HN': (0x195AA158, 'verified',   '5 台 SysCD 交叉验证 (017/019/020/024/027)'),
+    '2004051HN': (0x06380508, 'unverified', '011 号单约束反推；012 号数据有错'),
+    '2006068HN': (0x03020004, 'unverified', 'Z3 单约束反推未交叉'),
+    '2206010HN': (0x0B0324FD, 'unverified', 'Z3 单约束反推未交叉'),
+}
+
+
+def lookup_contract(contract_no: str):
+    """按出厂编号前缀查 param_114；返回 (param_114, trust, source) 或 None"""
+    s = (contract_no or '').strip().upper()
+    for prefix, val in KNOWN_CONTRACT_PARAM114.items():
+        if s.startswith(prefix):
+            return val
+    return None
+
+
 def crc32(data: bytes) -> int:
     crc = 0xFFFFFFFF
     for b in data:
@@ -1065,6 +1084,23 @@ class MasterScreen(Screen):
                                  on_press=self._autofill))
         root.add_widget(row)
 
+        # 合同号查询（内置合同库，无EEPROM时使用）
+        root.add_widget(make_label(
+            '或：按出厂编号查内置合同库（适用于已知批次的电梯）',
+            font_size=12, color=C_HINT, size_hint_y=None, height=dp(24)))
+        contract_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.inp_contract = make_input(
+            hint='出厂编号，如: 2109142HN-019')
+        contract_row.add_widget(self.inp_contract)
+        contract_row.add_widget(make_btn(
+            '查询并填入', color=(0.25, 0.55, 0.40, 1),
+            on_press=self._lookup_contract, size_hint_x=0.4))
+        root.add_widget(contract_row)
+        # 提示已知前缀
+        root.add_widget(make_label(
+            '已知前缀: ' + ' / '.join(KNOWN_CONTRACT_PARAM114.keys()),
+            font_size=11, color=C_HINT, size_hint_y=None, height=dp(20)))
+
         root.add_widget(make_btn('计算全权主码', color=C_SUCCESS,
                                   on_press=self._calc))
 
@@ -1098,6 +1134,30 @@ class MasterScreen(Screen):
             show_toast(f'已填入 0x{p114:08X}')
         else:
             show_toast('请先在"读取BIN"页解析文件')
+
+    def _lookup_contract(self, *_):
+        no = self.inp_contract.text.strip()
+        if not no:
+            show_toast('请输入出厂编号')
+            return
+        hit = lookup_contract(no)
+        if not hit:
+            show_toast('未在合同库中找到该编号')
+            self.result_lbl.text = (
+                f'[color=ff6666]合同号 "{no}" 不在内置库中[/color]\n'
+                f'已知前缀: ' + ', '.join(KNOWN_CONTRACT_PARAM114.keys())
+            )
+            return
+        param_114, trust, source = hit
+        self.inp_p114.text = f'0x{param_114:08X}'
+        color = '88ff88' if trust == 'verified' else 'ffaa33'
+        self.result_lbl.text = (
+            f'[color={color}]已从合同库填入 param_114 = 0x{param_114:08X}[/color]\n'
+            f'信任级别: {trust}\n'
+            f'来源: {source}\n\n'
+            f'[color=ffaa33]点击"计算全权主码"按钮继续[/color]'
+        )
+        show_toast(f'已填入 0x{param_114:08X} ({trust})')
 
     def _calc(self, *_):
         syscd_str = self.inp_syscd.text.strip().lstrip('0x').lstrip('0X')
