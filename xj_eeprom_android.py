@@ -249,6 +249,210 @@ def build_eeprom_image(custom_password: int = None) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 用户合同库 — 现场解一台顺手录入到 JSON，下次直接按合同号查
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json
+from datetime import datetime
+
+
+def get_user_data_path():
+    """用户合同库 JSON 文件路径（Android 用 Download/，PC 用 ~/Desktop/）"""
+    try:
+        from android.storage import primary_external_storage_path
+        base = primary_external_storage_path()
+        return os.path.join(base, 'Download', 'xj_contracts.json')
+    except Exception:
+        return os.path.join(os.path.expanduser('~'), 'Desktop', 'xj_contracts.json')
+
+
+class ContractStore:
+    """
+    用户增量录入的合同库（与硬编码 KNOWN_CONTRACT_PARAM114 并存）
+    JSON schema:
+      {
+        "version": 1,
+        "contracts": [
+          {
+            "prefix": "2109142HN",
+            "param_114": "0x195AA158",
+            "trust": "user_verified",   # user_record | user_verified | user_conflict
+            "verify_count": 3,
+            "first_seen": "2026-05-10T14:30:00",
+            "last_seen":  "2026-06-15T09:20:00",
+            "records": [
+              {"contract_no": "2109142HN-019", "param_114": "0x195AA158",
+               "date": "2026-05-10T14:30:00", "note": "", "source": "BIN解码"},
+              ...
+            ]
+          },
+          ...
+        ]
+      }
+    """
+    VERSION = 1
+
+    def __init__(self, path):
+        self.path = path
+        self._data = self._load()
+
+    def _load(self):
+        if not os.path.isfile(self.path):
+            return {'version': self.VERSION, 'contracts': []}
+        try:
+            with open(self.path, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            if 'contracts' not in d:
+                return {'version': self.VERSION, 'contracts': []}
+            return d
+        except Exception:
+            return {'version': self.VERSION, 'contracts': []}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        except Exception:
+            pass
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False)
+
+    def all(self):
+        return list(self._data['contracts'])
+
+    def find_by_no(self, contract_no: str):
+        s = (contract_no or '').strip().upper()
+        if not s:
+            return None
+        for c in self._data['contracts']:
+            if s.startswith(c['prefix']):
+                return c
+        return None
+
+    def find_by_prefix(self, prefix: str):
+        prefix = (prefix or '').strip().upper()
+        for c in self._data['contracts']:
+            if c['prefix'] == prefix:
+                return c
+        return None
+
+    def add(self, contract_no, prefix, param_114, note='', source='BIN解码'):
+        """
+        返回 (status, message, existing_obj):
+          'added'    — 新前缀加入
+          'verified' — 同前缀同值，verify_count +1
+          'conflict' — 同前缀但 param_114 不同（不写入，等用户决策）
+          'error'    — 输入无效
+        """
+        prefix = (prefix or '').strip().upper()
+        clean = prefix.replace('-', '').replace('_', '')
+        if not (4 <= len(prefix) <= 16) or not clean.isalnum():
+            return ('error', '前缀格式无效（4-16 位字母/数字）', None)
+        if not (0 <= param_114 <= 0xFFFFFFFF):
+            return ('error', 'param_114 超出 32 位范围', None)
+
+        now = datetime.now().isoformat(timespec='seconds')
+        new_record = {
+            'contract_no': (contract_no or '').strip(),
+            'param_114': f'0x{param_114:08X}',
+            'date': now,
+            'note': note or '',
+            'source': source,
+        }
+
+        existing = self.find_by_prefix(prefix)
+        if existing is None:
+            self._data['contracts'].append({
+                'prefix': prefix,
+                'param_114': f'0x{param_114:08X}',
+                'trust': 'user_record',
+                'verify_count': 1,
+                'first_seen': now,
+                'last_seen': now,
+                'records': [new_record],
+            })
+            self._save()
+            return ('added', f'新增 {prefix} → 0x{param_114:08X}', None)
+
+        existing_p114 = int(existing['param_114'], 16)
+        if existing_p114 == param_114:
+            existing['verify_count'] = existing.get('verify_count', 1) + 1
+            if existing['verify_count'] >= 2:
+                existing['trust'] = 'user_verified'
+            existing['last_seen'] = now
+            existing.setdefault('records', []).append(new_record)
+            self._save()
+            return ('verified',
+                    f'{prefix} 已验证 ×{existing["verify_count"]} ({existing["trust"]})',
+                    existing)
+
+        return ('conflict',
+                f'冲突: {prefix} 已有 {existing["param_114"]}，本次解出 0x{param_114:08X}',
+                existing)
+
+    def replace(self, prefix, param_114, contract_no='', note='', source='BIN解码'):
+        """冲突时用户选择覆盖 — 重置 trust=user_record, count=1, 历史保留"""
+        prefix = (prefix or '').strip().upper()
+        existing = self.find_by_prefix(prefix)
+        if not existing:
+            return self.add(contract_no, prefix, param_114, note, source)
+        now = datetime.now().isoformat(timespec='seconds')
+        existing['param_114'] = f'0x{param_114:08X}'
+        existing['trust'] = 'user_record'
+        existing['verify_count'] = 1
+        existing['last_seen'] = now
+        existing.setdefault('records', []).append({
+            'contract_no': (contract_no or '').strip(),
+            'param_114': f'0x{param_114:08X}',
+            'date': now,
+            'note': ((note or '') + '  [覆盖原值]').strip(),
+            'source': source,
+        })
+        self._save()
+        return ('replaced', f'已覆盖 {prefix} → 0x{param_114:08X}', existing)
+
+    def remove(self, prefix):
+        prefix = (prefix or '').strip().upper()
+        before = len(self._data['contracts'])
+        self._data['contracts'] = [c for c in self._data['contracts']
+                                    if c['prefix'] != prefix]
+        if len(self._data['contracts']) < before:
+            self._save()
+            return True
+        return False
+
+    def clear(self):
+        self._data['contracts'] = []
+        self._save()
+
+    def export_to(self, dst):
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+        except Exception:
+            pass
+        with open(dst, 'w', encoding='utf-8') as f:
+            json.dump(self._data, f, indent=2, ensure_ascii=False)
+
+    def import_from(self, src, merge=True):
+        with open(src, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if 'contracts' not in data or not isinstance(data['contracts'], list):
+            raise ValueError('文件格式无效（缺 contracts 字段）')
+        if not merge:
+            self._data = {'version': self.VERSION, 'contracts': data['contracts']}
+            self._save()
+            return len(data['contracts'])
+        added = 0
+        for c in data['contracts']:
+            if not isinstance(c, dict) or 'prefix' not in c:
+                continue
+            if not self.find_by_prefix(c['prefix']):
+                self._data['contracts'].append(c)
+                added += 1
+        self._save()
+        return added
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Kivy GUI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -645,6 +849,128 @@ def show_toast(msg):
     Clock.schedule_once(lambda _: popup.dismiss(), 2.5)
 
 
+# ── 录入合同库弹窗 ───────────────────────────────────────────────────────────
+
+class RecordPopup(Popup):
+    """录入一条合同库记录（编号/前缀/param_114/备注）"""
+
+    def __init__(self, contract_no='', prefix='', param_114=0,
+                 source='BIN解码', on_save=None, **kw):
+        self._on_save = on_save
+        self._param_114 = param_114
+        body = BoxLayout(orientation='vertical',
+                         padding=dp(10), spacing=dp(8))
+
+        body.add_widget(make_label(
+            '出厂编号（如 2109142HN-019）：',
+            font_size=12, color=C_HINT, size_hint_y=None, height=dp(22)))
+        self.inp_no = make_input(hint='完整出厂编号', height=42)
+        self.inp_no.text = contract_no
+        self.inp_no.bind(text=self._on_no_change)
+        body.add_widget(self.inp_no)
+
+        body.add_widget(make_label(
+            '合同前缀（自动从编号提取，可手改）：',
+            font_size=12, color=C_HINT, size_hint_y=None, height=dp(22)))
+        self.inp_prefix = make_input(hint='如 2109142HN', height=42)
+        self.inp_prefix.text = prefix or self._auto_prefix(contract_no)
+        body.add_widget(self.inp_prefix)
+
+        body.add_widget(make_label(
+            f'[b]param_114:[/b]  0x{param_114:08X}  ({source})',
+            font_size=13, size_hint_y=None, height=dp(28)))
+
+        body.add_widget(make_label(
+            '备注（可选）：', font_size=12, color=C_HINT,
+            size_hint_y=None, height=dp(22)))
+        self.inp_note = make_input(hint='如：现场=杭州XX大厦  设备号=#19', height=42)
+        body.add_widget(self.inp_note)
+
+        body.add_widget(Label())  # spacer
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        btn_row.add_widget(make_btn('取消', color=(0.40, 0.40, 0.45, 1),
+                                     on_press=self._cancel, height=46))
+        btn_row.add_widget(make_btn('保存', color=C_SUCCESS,
+                                     on_press=self._save, height=46))
+        body.add_widget(btn_row)
+
+        super().__init__(
+            title='录入合同库',
+            content=body,
+            size_hint=(0.92, 0.75),
+            background_color=(0.13, 0.15, 0.20, 0.98),
+            **kw,
+        )
+
+    @staticmethod
+    def _auto_prefix(contract_no: str) -> str:
+        """从完整编号提取前缀：取 - 之前部分；若无 -，取前 9 字符"""
+        s = (contract_no or '').strip().upper()
+        if '-' in s:
+            return s.split('-', 1)[0]
+        return s[:9]
+
+    def _on_no_change(self, _inst, value):
+        # 编号改了，自动同步 prefix（仅当 prefix 是空时；用户改过就别再覆盖）
+        if not self.inp_prefix.text.strip():
+            self.inp_prefix.text = self._auto_prefix(value)
+
+    def _cancel(self, *_):
+        self.dismiss()
+
+    def _save(self, *_):
+        no = self.inp_no.text.strip()
+        prefix = self.inp_prefix.text.strip().upper()
+        note = self.inp_note.text.strip()
+        if not no:
+            show_toast('请输入出厂编号')
+            return
+        if not prefix:
+            show_toast('请输入合同前缀')
+            return
+        if self._on_save:
+            self._on_save(no, prefix, self._param_114, note)
+        self.dismiss()
+
+
+# ── 冲突提示弹窗 ─────────────────────────────────────────────────────────────
+
+class ConflictPopup(Popup):
+    """合同库录入时同前缀但 param_114 不同 — 让用户选保留 / 覆盖"""
+
+    def __init__(self, prefix, old_p114_hex, new_p114, on_replace=None, **kw):
+        body = BoxLayout(orientation='vertical', padding=dp(12), spacing=dp(10))
+        body.add_widget(make_label(
+            f'[b][color=ff8844]检测到冲突[/color][/b]',
+            font_size=15, halign='center',
+            size_hint_y=None, height=dp(30)))
+        body.add_widget(make_label(
+            f'前缀 [b]{prefix}[/b] 在合同库中已有不同的 param_114：\n\n'
+            f'  已存:  [color=88ddff]{old_p114_hex}[/color]\n'
+            f'  本次:  [color=ffaa44]0x{new_p114:08X}[/color]\n\n'
+            f'可能原因：抄写错、SysCD 跨刷新窗口、或确实是不同批次。',
+            font_size=13, size_hint_y=None, height=dp(160)))
+        body.add_widget(Label())
+        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        btn_row.add_widget(make_btn('保留旧值', color=(0.40, 0.40, 0.45, 1),
+                                     on_press=lambda _: self.dismiss(), height=46))
+        btn_row.add_widget(make_btn('覆盖为新值', color=(0.85, 0.45, 0.20, 1),
+                                     on_press=lambda _: self._replace(on_replace),
+                                     height=46))
+        body.add_widget(btn_row)
+        super().__init__(
+            title='冲突', content=body,
+            size_hint=(0.9, 0.55),
+            background_color=(0.13, 0.15, 0.20, 0.98), **kw,
+        )
+
+    def _replace(self, cb):
+        if cb:
+            cb()
+        self.dismiss()
+
+
 # ── 屏幕1：BIN文件提取密码 ───────────────────────────────────────────────────
 
 class ExtractScreen(Screen):
@@ -691,6 +1017,7 @@ class ExtractScreen(Screen):
         # 复制按钮区（解析成功后显示）
         self._pw     = None
         self._alt_pw = None
+        self._last_p114 = None
         self.copy_row = BoxLayout(
             size_hint_y=None, height=0, spacing=dp(6), opacity=0)
         self.btn_copy_pw = make_btn(
@@ -702,6 +1029,16 @@ class ExtractScreen(Screen):
         self.copy_row.add_widget(self.btn_copy_pw)
         self.copy_row.add_widget(self.btn_copy_alt)
         root.add_widget(self.copy_row)
+
+        # 录入合同库按钮（block1_ok 且有 param_114 时显示）
+        self.record_row = BoxLayout(
+            size_hint_y=None, height=0, spacing=dp(6), opacity=0)
+        self.btn_record = make_btn(
+            '📥 录入到合同库（顺手存 param_114）',
+            color=(0.55, 0.40, 0.20, 1),
+            on_press=self._open_record_popup, height=46)
+        self.record_row.add_widget(self.btn_record)
+        root.add_widget(self.record_row)
 
         # 结果区
         root.add_widget(make_label(
@@ -861,13 +1198,64 @@ class ExtractScreen(Screen):
         # 保存密码并显示复制按钮
         self._pw     = pw
         self._alt_pw = alt_pw
+        self._last_p114 = p114 if (result.get('block1_ok') and p114) else None
         self.copy_row.height   = dp(50)
         self.copy_row.opacity  = 1
         self.btn_copy_pw.text  = f'复制主密码  {pw}'
         self.btn_copy_alt.text = f'复制备用密码  {alt_pw}'
 
+        # 显示录入合同库按钮（仅当 block1 校验通过且 param_114 有效时）
+        if self._last_p114 is not None:
+            self.record_row.height  = dp(52)
+            self.record_row.opacity = 1
+        else:
+            self.record_row.height  = 0
+            self.record_row.opacity = 0
+
         # 保存 param_114 供主码页使用
         App.get_running_app().last_param114 = p114
+
+    # ── 录入合同库 ─────────────────────────────────────────────────
+    def _open_record_popup(self, *_):
+        if self._last_p114 is None:
+            show_toast('请先解析 BIN 并确保参数块校验通过')
+            return
+        # 文件名作为编号默认值（去掉扩展名）
+        default_no = ''
+        if self._file_path:
+            default_no = os.path.splitext(os.path.basename(self._file_path))[0]
+        RecordPopup(
+            contract_no=default_no,
+            prefix='',
+            param_114=self._last_p114,
+            source='BIN解码',
+            on_save=self._do_record_save,
+        ).open()
+
+    def _do_record_save(self, contract_no, prefix, param_114, note):
+        store = App.get_running_app().contract_store
+        status, msg, existing = store.add(contract_no, prefix, param_114, note=note)
+        if status == 'error':
+            show_toast(msg)
+            return
+        if status == 'conflict':
+            old_hex = existing['param_114']
+            ConflictPopup(
+                prefix=prefix.upper(),
+                old_p114_hex=old_hex,
+                new_p114=param_114,
+                on_replace=lambda: self._do_record_replace(
+                    contract_no, prefix, param_114, note),
+            ).open()
+            return
+        # added / verified
+        show_toast(f'✓ {msg}')
+
+    def _do_record_replace(self, contract_no, prefix, param_114, note):
+        store = App.get_running_app().contract_store
+        status, msg, _ = store.replace(prefix, param_114,
+                                        contract_no=contract_no, note=note)
+        show_toast(f'✓ {msg}')
 
     # ── 复制到剪贴板 ──────────────────────────────────────────────
     def _copy_pw(self, *_):
@@ -1141,24 +1529,50 @@ class MasterScreen(Screen):
         if not no:
             show_toast('请输入出厂编号')
             return
-        hit = lookup_contract(no)
-        if not hit:
-            show_toast('未在合同库中找到该编号')
+
+        # 优先查用户库（含现场录入的）
+        store = App.get_running_app().contract_store
+        user_hit = store.find_by_no(no)
+        if user_hit:
+            p_hex = user_hit['param_114']
+            self.inp_p114.text = p_hex
+            trust = user_hit.get('trust', 'user_record')
+            count = user_hit.get('verify_count', 1)
+            color = '88ff88' if trust == 'user_verified' else 'ffaa33'
             self.result_lbl.text = (
-                f'[color=ff6666]合同号 "{no}" 不在内置库中[/color]\n'
-                f'已知前缀: ' + ', '.join(KNOWN_CONTRACT_PARAM114.keys())
+                f'[color={color}]✓ 用户库命中 → param_114 = {p_hex}[/color]\n'
+                f'前缀: {user_hit["prefix"]}\n'
+                f'信任: {trust}  (已录入 {count} 次)\n'
+                f'最近: {user_hit.get("last_seen", "?")[:16]}\n\n'
+                f'[color=ffaa33]点击"计算全权主码"按钮继续[/color]'
+            )
+            show_toast(f'用户库命中 {p_hex}')
+            return
+
+        # 用户库没命中 → 查内置库
+        builtin_hit = lookup_contract(no)
+        if not builtin_hit:
+            show_toast('两个库都没找到该编号')
+            user_keys = [c['prefix'] for c in store.all()]
+            all_keys = list(KNOWN_CONTRACT_PARAM114.keys()) + user_keys
+            self.result_lbl.text = (
+                f'[color=ff6666]合同号 "{no}" 在两个库中都没找到[/color]\n\n'
+                f'内置: {", ".join(KNOWN_CONTRACT_PARAM114.keys())}\n'
+                f'用户: {", ".join(user_keys) if user_keys else "(空)"}\n\n'
+                f'提示：在"读取BIN"页解码新设备后可顺手录入'
             )
             return
-        param_114, trust, source = hit
+
+        param_114, trust, source = builtin_hit
         self.inp_p114.text = f'0x{param_114:08X}'
         color = '88ff88' if trust == 'verified' else 'ffaa33'
         self.result_lbl.text = (
-            f'[color={color}]已从合同库填入 param_114 = 0x{param_114:08X}[/color]\n'
+            f'[color={color}]✓ 内置库命中 → param_114 = 0x{param_114:08X}[/color]\n'
             f'信任级别: {trust}\n'
             f'来源: {source}\n\n'
             f'[color=ffaa33]点击"计算全权主码"按钮继续[/color]'
         )
-        show_toast(f'已填入 0x{param_114:08X} ({trust})')
+        show_toast(f'内置库命中 0x{param_114:08X} ({trust})')
 
     def _calc(self, *_):
         syscd_str = self.inp_syscd.text.strip().lstrip('0x').lstrip('0X')
@@ -1218,6 +1632,314 @@ class MasterScreen(Screen):
         show_toast(f'已复制延时主码：{self._delay_pw:09d}')
 
 
+# ── 屏幕5：合同库管理 ────────────────────────────────────────────────────────
+
+class ManualAddPopup(Popup):
+    """手动新增合同库记录（不依赖 BIN 文件，直接填编号+param_114）"""
+
+    def __init__(self, on_save=None, **kw):
+        self._on_save = on_save
+        body = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(8))
+
+        body.add_widget(make_label('出厂编号：', font_size=12, color=C_HINT,
+                                   size_hint_y=None, height=dp(22)))
+        self.inp_no = make_input(hint='完整出厂编号', height=42)
+        body.add_widget(self.inp_no)
+
+        body.add_widget(make_label('合同前缀：', font_size=12, color=C_HINT,
+                                   size_hint_y=None, height=dp(22)))
+        self.inp_prefix = make_input(hint='如 2109142HN', height=42)
+        body.add_widget(self.inp_prefix)
+
+        body.add_widget(make_label('param_114（十六进制）：', font_size=12,
+                                   color=C_HINT, size_hint_y=None, height=dp(22)))
+        self.inp_p114 = make_input(hint='如 0x195AA158', height=42)
+        body.add_widget(self.inp_p114)
+
+        body.add_widget(make_label('备注：', font_size=12, color=C_HINT,
+                                   size_hint_y=None, height=dp(22)))
+        self.inp_note = make_input(hint='可选', height=42)
+        body.add_widget(self.inp_note)
+
+        body.add_widget(Label())
+        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        btn_row.add_widget(make_btn('取消', color=(0.40, 0.40, 0.45, 1),
+                                     on_press=lambda _: self.dismiss(), height=46))
+        btn_row.add_widget(make_btn('保存', color=C_SUCCESS,
+                                     on_press=self._save, height=46))
+        body.add_widget(btn_row)
+
+        super().__init__(title='手动添加', content=body,
+                         size_hint=(0.92, 0.7),
+                         background_color=(0.13, 0.15, 0.20, 0.98), **kw)
+
+    def _save(self, *_):
+        no = self.inp_no.text.strip()
+        prefix = self.inp_prefix.text.strip().upper()
+        p_str = self.inp_p114.text.strip().lstrip('0x').lstrip('0X')
+        note = self.inp_note.text.strip()
+        if not no or not prefix or not p_str:
+            show_toast('编号、前缀、param_114 都要填')
+            return
+        try:
+            param_114 = int(p_str, 16)
+        except ValueError:
+            show_toast('param_114 格式无效（要求十六进制）')
+            return
+        if self._on_save:
+            self._on_save(no, prefix, param_114, note)
+        self.dismiss()
+
+
+class FilePathPopup(Popup):
+    """简单的路径输入弹窗（导入/导出 JSON 用）"""
+
+    def __init__(self, title='', default_path='', on_ok=None, **kw):
+        self._on_ok = on_ok
+        body = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(8))
+        body.add_widget(make_label('文件路径：', font_size=12, color=C_HINT,
+                                   size_hint_y=None, height=dp(22)))
+        self.inp_path = make_input(hint=default_path, height=46)
+        self.inp_path.text = default_path
+        body.add_widget(self.inp_path)
+        body.add_widget(Label())
+        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        btn_row.add_widget(make_btn('取消', color=(0.40, 0.40, 0.45, 1),
+                                     on_press=lambda _: self.dismiss(), height=46))
+        btn_row.add_widget(make_btn('确定', color=C_SUCCESS,
+                                     on_press=self._ok, height=46))
+        body.add_widget(btn_row)
+        super().__init__(title=title, content=body,
+                         size_hint=(0.92, 0.4),
+                         background_color=(0.13, 0.15, 0.20, 0.98), **kw)
+
+    def _ok(self, *_):
+        path = self.inp_path.text.strip().strip('"')
+        if not path:
+            show_toast('请输入文件路径')
+            return
+        if self._on_ok:
+            self._on_ok(path)
+        self.dismiss()
+
+
+class ContractScreen(Screen):
+    """合同库管理：列出用户库 + 内置库；删除/导入/导出/手动添加"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        root = BoxLayout(orientation='vertical',
+                         padding=dp(10), spacing=dp(6))
+
+        root.add_widget(make_label(
+            '[b]合同库管理[/b]',
+            font_size=17, halign='center', size_hint_y=None, height=dp(34)))
+
+        # 路径提示
+        self.lbl_path = make_label(
+            '', font_size=11, color=C_HINT,
+            size_hint_y=None, height=dp(20))
+        root.add_widget(self.lbl_path)
+
+        # 操作按钮区（2 行）
+        btn_row1 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        btn_row1.add_widget(make_btn('+ 手动添加', color=C_ACCENT,
+                                      on_press=self._manual_add, height=44))
+        btn_row1.add_widget(make_btn('刷新', color=(0.30, 0.40, 0.55, 1),
+                                      on_press=lambda _: self.refresh(), height=44))
+        root.add_widget(btn_row1)
+
+        btn_row2 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        btn_row2.add_widget(make_btn('导出 JSON', color=(0.25, 0.55, 0.40, 1),
+                                      on_press=self._export, height=44))
+        btn_row2.add_widget(make_btn('导入合并', color=(0.40, 0.50, 0.30, 1),
+                                      on_press=self._import, height=44))
+        btn_row2.add_widget(make_btn('清空用户库', color=(0.70, 0.30, 0.30, 1),
+                                      on_press=self._clear, height=44))
+        root.add_widget(btn_row2)
+
+        # 列表区
+        self.sv = ScrollView()
+        self.list_box = BoxLayout(orientation='vertical',
+                                   size_hint_y=None,
+                                   spacing=dp(2), padding=[0, 0, 0, dp(8)])
+        self.list_box.bind(
+            minimum_height=lambda i, v: setattr(i, 'height', v))
+        self.sv.add_widget(self.list_box)
+        root.add_widget(self.sv)
+
+        self.add_widget(root)
+
+    def on_pre_enter(self, *_):
+        self.refresh()
+
+    def refresh(self):
+        self.list_box.clear_widgets()
+        store = App.get_running_app().contract_store
+        self.lbl_path.text = f'存储: {store.path}'
+
+        # 用户库
+        user_records = store.all()
+        self._add_section(f'═══ 用户库 ({len(user_records)}) ═══', C_ACCENT)
+        if not user_records:
+            self.list_box.add_widget(make_label(
+                '  (空 — 在"读取BIN"页解码后点"录入到合同库"开始添加)',
+                font_size=12, color=C_HINT,
+                size_hint_y=None, height=dp(40)))
+        else:
+            for c in user_records:
+                self._add_user_row(c)
+
+        # 内置库
+        self._add_section(f'═══ 内置库 ({len(KNOWN_CONTRACT_PARAM114)}) — 只读 ═══',
+                          (0.55, 0.50, 0.40, 1))
+        for prefix, val in KNOWN_CONTRACT_PARAM114.items():
+            param_114, trust, source = val
+            self._add_builtin_row(prefix, param_114, trust, source)
+
+    def _add_section(self, text, color):
+        lbl = Label(
+            text=f'[b]{text}[/b]',
+            font_size=dp(13), color=color,
+            halign='left', valign='middle', markup=True,
+            size_hint_y=None, height=dp(34),
+            padding=[dp(6), 0],
+        )
+        lbl.bind(size=lambda i, v: setattr(i, 'text_size', v))
+        self.list_box.add_widget(lbl)
+
+    def _add_user_row(self, c):
+        row = BoxLayout(size_hint_y=None, height=dp(64),
+                         padding=[dp(6), dp(2)], spacing=dp(4))
+        trust = c.get('trust', 'user_record')
+        count = c.get('verify_count', 1)
+        info_color = '88ff88' if trust == 'user_verified' else 'ffaa33'
+        info_text = (
+            f'[b]{c["prefix"]}[/b]  [color={info_color}]{c["param_114"]}[/color]\n'
+            f'[size=11][color=999999]{trust} ×{count}  '
+            f'最近: {c.get("last_seen", "?")[:10]}[/color][/size]'
+        )
+        info_lbl = Label(text=info_text, font_size=dp(13), color=C_TEXT,
+                          halign='left', valign='middle', markup=True,
+                          size_hint_x=0.7)
+        info_lbl.bind(size=lambda i, v: setattr(i, 'text_size', v))
+        row.add_widget(info_lbl)
+
+        btn_del = make_btn('删除', color=(0.55, 0.30, 0.30, 1),
+                            on_press=lambda _, p=c['prefix']: self._delete(p),
+                            height=44, size_hint_x=0.3)
+        row.add_widget(btn_del)
+
+        self.list_box.add_widget(row)
+
+    def _add_builtin_row(self, prefix, param_114, trust, source):
+        info_color = '88ff88' if trust == 'verified' else 'aaaaaa'
+        text = (
+            f'[b]{prefix}[/b]  [color={info_color}]0x{param_114:08X}[/color]  '
+            f'[size=11][color=999999]({trust})[/color][/size]\n'
+            f'[size=11][color=777777]{source}[/color][/size]'
+        )
+        lbl = Label(text=text, font_size=dp(12), color=C_TEXT,
+                     halign='left', valign='middle', markup=True,
+                     size_hint_y=None, height=dp(56),
+                     padding=[dp(6), 0])
+        lbl.bind(size=lambda i, v: setattr(i, 'text_size', v))
+        self.list_box.add_widget(lbl)
+
+    def _manual_add(self, *_):
+        ManualAddPopup(on_save=self._do_save).open()
+
+    def _do_save(self, contract_no, prefix, param_114, note):
+        store = App.get_running_app().contract_store
+        status, msg, existing = store.add(contract_no, prefix, param_114, note=note,
+                                           source='手动添加')
+        if status == 'error':
+            show_toast(msg)
+        elif status == 'conflict':
+            ConflictPopup(
+                prefix=prefix.upper(),
+                old_p114_hex=existing['param_114'],
+                new_p114=param_114,
+                on_replace=lambda: self._do_replace(contract_no, prefix,
+                                                    param_114, note),
+            ).open()
+        else:
+            show_toast(f'✓ {msg}')
+            self.refresh()
+
+    def _do_replace(self, contract_no, prefix, param_114, note):
+        store = App.get_running_app().contract_store
+        status, msg, _ = store.replace(prefix, param_114,
+                                        contract_no=contract_no, note=note,
+                                        source='手动添加')
+        show_toast(f'✓ {msg}')
+        self.refresh()
+
+    def _delete(self, prefix):
+        store = App.get_running_app().contract_store
+        if store.remove(prefix):
+            show_toast(f'已删除 {prefix}')
+            self.refresh()
+        else:
+            show_toast(f'未找到 {prefix}')
+
+    def _clear(self, *_):
+        store = App.get_running_app().contract_store
+        if not store.all():
+            show_toast('用户库已为空')
+            return
+        store.clear()
+        show_toast('用户库已清空')
+        self.refresh()
+
+    def _export(self, *_):
+        store = App.get_running_app().contract_store
+        try:
+            from android.storage import primary_external_storage_path
+            base = primary_external_storage_path()
+            default_dst = os.path.join(base, 'Download',
+                                        f'xj_contracts_export_'
+                                        f'{datetime.now().strftime("%Y%m%d_%H%M")}.json')
+        except Exception:
+            default_dst = os.path.join(os.path.expanduser('~'), 'Desktop',
+                                        f'xj_contracts_export_'
+                                        f'{datetime.now().strftime("%Y%m%d_%H%M")}.json')
+
+        def do_export(dst):
+            try:
+                store.export_to(dst)
+                show_toast(f'✓ 已导出到: {os.path.basename(dst)}')
+            except Exception as e:
+                show_toast(f'导出失败: {e}')
+
+        FilePathPopup(title='导出到', default_path=default_dst,
+                       on_ok=do_export).open()
+
+    def _import(self, *_):
+        store = App.get_running_app().contract_store
+        try:
+            from android.storage import primary_external_storage_path
+            base = primary_external_storage_path()
+            default_src = os.path.join(base, 'Download', 'xj_contracts.json')
+        except Exception:
+            default_src = os.path.join(os.path.expanduser('~'), 'Desktop',
+                                        'xj_contracts.json')
+
+        def do_import(src):
+            if not os.path.isfile(src):
+                show_toast(f'文件不存在: {src}')
+                return
+            try:
+                added = store.import_from(src, merge=True)
+                show_toast(f'✓ 合并完成，新增 {added} 条')
+                self.refresh()
+            except Exception as e:
+                show_toast(f'导入失败: {e}')
+
+        FilePathPopup(title='从此文件导入合并', default_path=default_src,
+                       on_ok=do_import).open()
+
+
 # ── 底部导航栏 ───────────────────────────────────────────────────────────────
 
 class NavBar(BoxLayout):
@@ -1226,6 +1948,7 @@ class NavBar(BoxLayout):
         ('字节计算', 'calc'),
         ('生成镜像', 'generate'),
         ('主码计算', 'master'),
+        ('合同库',   'contracts'),
     ]
 
     def __init__(self, sm, **kw):
@@ -1266,15 +1989,26 @@ class NavBar(BoxLayout):
 
 class XJEepromApp(App):
     last_param114 = None
+    contract_store = None
 
     def build(self):
         Window.clearcolor = C_BG
+
+        # 初始化用户合同库（JSON 持久化）
+        try:
+            self.contract_store = ContractStore(get_user_data_path())
+        except Exception as e:
+            # 万一 IO 失败，给个内存空实例避免崩溃
+            self.contract_store = ContractStore.__new__(ContractStore)
+            self.contract_store.path = ''
+            self.contract_store._data = {'version': 1, 'contracts': []}
 
         sm = ScreenManager()
         sm.add_widget(ExtractScreen(name='extract'))
         sm.add_widget(CalcScreen(name='calc'))
         sm.add_widget(GenerateScreen(name='generate'))
         sm.add_widget(MasterScreen(name='master'))
+        sm.add_widget(ContractScreen(name='contracts'))
 
         nav = NavBar(sm)
 
